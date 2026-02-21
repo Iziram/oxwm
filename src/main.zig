@@ -11,7 +11,6 @@ const scrolling = @import("layouts/scrolling.zig");
 const bar_mod = @import("bar/bar.zig");
 const config_mod = @import("config/config.zig");
 const lua = @import("config/lua.zig");
-const overlay_mod = @import("overlay.zig");
 
 const Display = display_mod.Display;
 const Client = client_mod.Client;
@@ -26,36 +25,13 @@ const IconicState: c_long = 3;
 const IsViewable: c_int = 2;
 const snap_distance: i32 = 32;
 
-// Remaining module-level state
-
-/// Config built from Lua, passed into WindowManager.init.
+/// Config built from Lua, passed into `WindowManager.init`.
 var config: config_mod.Config = undefined;
-/// Path to the loaded config file, kept for hot-reload.
+/// Path to the loaded config file.
 var config_path_global: ?[]const u8 = null;
 
-/// TODO(wm-refactor): move into WindowManager, waiting on handle_key_press
-/// and execute_action being converted to methods.
-var chord = @import("keyboard/chord.zig").ChordState{};
-
-/// TODO(wm-refactor): remove once all callers are WindowManager methods.
-/// Aliases wm.atoms so existing functions that take display but not wm
-/// can still reach atom values without requiring a full signature change.
-var atoms: @import("x11/atoms.zig").Atoms = undefined;
-
-/// TODO(wm-refactor): move into WindowManager, waiting on arrange() becoming
-/// a method so it can access self.display directly.
-var wm_display: ?*Display = null;
-
-/// TODO(wm-refactor): remove once all callers are WindowManager methods.
-/// Used only by functions that need to invalidate bars but don't yet receive
-/// wm as a parameter.
-var wm_ptr: ?*WindowManager = null;
-
-/// TODO(wm-refactor): move into WindowManager.
-var numlock_mask: c_uint = 0;
-
 /// File descriptor of the X11 connection, used in spawn_child_setup.
-/// Set from wm.x11_fd after init.
+/// Set from `wm.x11_fd` after init.
 var x11_fd: c_int = -1;
 
 fn print_help() void {
@@ -223,16 +199,13 @@ pub fn main() !void {
     // Propagate values that transitional code in this file still reads
     // from module-level vars. These will be removed soon.
     x11_fd = wm.x11_fd;
-    wm_display = &wm.display;
-    wm_ptr = &wm;
-    atoms = wm.atoms;
 
     std.debug.print("display opened: screen={d} root=0x{x}\n", .{ wm.display.screen, wm.display.root });
     std.debug.print("successfully became window manager\n", .{});
     std.debug.print("atoms initialized with EWMH support\n", .{});
 
-    grab_keybinds(&wm.display);
-    scan_existing_windows(&wm.display);
+    grab_keybinds(&wm.display, &wm);
+    scan_existing_windows(&wm.display, &wm);
 
     try run_autostart_commands(allocator, config.autostart.items);
     std.debug.print("entering event loop\n", .{});
@@ -302,9 +275,9 @@ fn initialize_default_config() void {
     config.add_button(.{ .click = .client_win, .mod_mask = mod_key, .button = 3, .action = .resize_mouse }) catch {};
 }
 
-fn grab_keybinds(display: *Display) void {
-    update_numlock_mask(display);
-    const modifiers = [_]c_uint{ 0, xlib.LockMask, numlock_mask, numlock_mask | xlib.LockMask };
+fn grab_keybinds(display: *Display, wm: *WindowManager) void {
+    update_numlock_mask(display, wm);
+    const modifiers = [_]c_uint{ 0, xlib.LockMask, wm.numlock_mask, wm.numlock_mask | xlib.LockMask };
 
     _ = xlib.XUngrabKey(display.handle, xlib.AnyKey, xlib.AnyModifier, display.root);
 
@@ -349,7 +322,7 @@ fn grab_keybinds(display: *Display) void {
     std.debug.print("grabbed {d} keybinds from config\n", .{config.keybinds.items.len});
 }
 
-fn get_state(display: *Display, window: xlib.Window) c_long {
+fn get_state(display: *Display, window: xlib.Window, wm: *WindowManager) c_long {
     var actual_type: xlib.Atom = 0;
     var actual_format: c_int = 0;
     var num_items: c_ulong = 0;
@@ -359,11 +332,11 @@ fn get_state(display: *Display, window: xlib.Window) c_long {
     const result = xlib.XGetWindowProperty(
         display.handle,
         window,
-        atoms.wm_state,
+        wm.atoms.wm_state,
         0,
         2,
         xlib.False,
-        atoms.wm_state,
+        wm.atoms.wm_state,
         &actual_type,
         &actual_format,
         &num_items,
@@ -371,7 +344,7 @@ fn get_state(display: *Display, window: xlib.Window) c_long {
         &prop,
     );
 
-    if (result != 0 or actual_type != atoms.wm_state or num_items < 1) {
+    if (result != 0 or actual_type != wm.atoms.wm_state or num_items < 1) {
         if (prop != null) {
             _ = xlib.XFree(prop);
         }
@@ -383,7 +356,7 @@ fn get_state(display: *Display, window: xlib.Window) c_long {
     return state;
 }
 
-fn scan_existing_windows(display: *Display) void {
+fn scan_existing_windows(display: *Display, wm: *WindowManager) void {
     var root_return: xlib.Window = undefined;
     var parent_return: xlib.Window = undefined;
     var children: [*c]xlib.Window = undefined;
@@ -406,8 +379,8 @@ fn scan_existing_windows(display: *Display) void {
         if (xlib.XGetTransientForHint(display.handle, children[index], &trans) != 0) {
             continue;
         }
-        if (window_attrs.map_state == IsViewable or get_state(display, children[index]) == IconicState) {
-            manage(display, children[index], &window_attrs);
+        if (window_attrs.map_state == IsViewable or get_state(display, children[index], wm) == IconicState) {
+            manage(display, children[index], &window_attrs, wm);
         }
     }
 
@@ -419,8 +392,8 @@ fn scan_existing_windows(display: *Display) void {
         }
         var trans: xlib.Window = 0;
         if (xlib.XGetTransientForHint(display.handle, children[index], &trans) != 0) {
-            if (window_attrs.map_state == IsViewable or get_state(display, children[index]) == IconicState) {
-                manage(display, children[index], &window_attrs);
+            if (window_attrs.map_state == IsViewable or get_state(display, children[index], wm) == IconicState) {
+                manage(display, children[index], &window_attrs, wm);
             }
         }
     }
@@ -465,23 +438,23 @@ fn handle_event(display: *Display, event: *xlib.XEvent, wm: *WindowManager) void
     }
 
     switch (event_type) {
-        .map_request => handle_map_request(display, &event.xmaprequest),
-        .configure_request => handle_configure_request(display, &event.xconfigurerequest),
+        .map_request => handle_map_request(display, &event.xmaprequest, wm),
+        .configure_request => handle_configure_request(display, &event.xconfigurerequest, wm),
         .key_press => handle_key_press(display, &event.xkey, wm),
-        .destroy_notify => handle_destroy_notify(display, &event.xdestroywindow),
-        .unmap_notify => handle_unmap_notify(display, &event.xunmap),
+        .destroy_notify => handle_destroy_notify(display, &event.xdestroywindow, wm),
+        .unmap_notify => handle_unmap_notify(display, &event.xunmap, wm),
         .enter_notify => handle_enter_notify(display, &event.xcrossing, wm),
-        .focus_in => handle_focus_in(display, &event.xfocus),
+        .focus_in => handle_focus_in(display, &event.xfocus, wm),
         .motion_notify => handle_motion_notify(display, &event.xmotion, wm),
-        .client_message => handle_client_message(display, &event.xclient),
+        .client_message => handle_client_message(display, &event.xclient, wm),
         .button_press => handle_button_press(display, &event.xbutton, wm),
         .expose => handle_expose(display, &event.xexpose, wm),
-        .property_notify => handle_property_notify(display, &event.xproperty),
+        .property_notify => handle_property_notify(display, &event.xproperty, wm),
         else => {},
     }
 }
 
-fn handle_map_request(display: *Display, event: *xlib.XMapRequestEvent) void {
+fn handle_map_request(display: *Display, event: *xlib.XMapRequestEvent, wm: *WindowManager) void {
     std.debug.print("map_request: window=0x{x}\n", .{event.window});
 
     var window_attributes: xlib.XWindowAttributes = undefined;
@@ -495,10 +468,10 @@ fn handle_map_request(display: *Display, event: *xlib.XMapRequestEvent) void {
         return;
     }
 
-    manage(display, event.window, &window_attributes);
+    manage(display, event.window, &window_attributes, wm);
 }
 
-fn manage(display: *Display, win: xlib.Window, window_attrs: *xlib.XWindowAttributes) void {
+fn manage(display: *Display, win: xlib.Window, window_attrs: *xlib.XWindowAttributes, wm: *WindowManager) void {
     const client = client_mod.create(gpa.allocator(), win) orelse return;
     var trans: xlib.Window = 0;
 
@@ -513,7 +486,7 @@ fn manage(display: *Display, win: xlib.Window, window_attrs: *xlib.XWindowAttrib
     client.old_border_width = window_attrs.border_width;
     client.border_width = config.border_width;
 
-    update_title(display, client);
+    update_title(display, client, wm);
 
     if (xlib.XGetTransientForHint(display.handle, win, &trans) != 0) {
         if (client_mod.window_to_client(monitor_mod.monitors, trans)) |transient_client| {
@@ -524,7 +497,7 @@ fn manage(display: *Display, win: xlib.Window, window_attrs: *xlib.XWindowAttrib
 
     if (client.monitor == null) {
         client.monitor = monitor_mod.selected_monitor;
-        apply_rules(display, client);
+        apply_rules(display, client, wm);
     }
 
     const monitor = client.monitor orelse return;
@@ -542,7 +515,7 @@ fn manage(display: *Display, win: xlib.Window, window_attrs: *xlib.XWindowAttrib
     _ = xlib.XSetWindowBorder(display.handle, win, config.border_unfocused);
     tiling.send_configure(client);
 
-    update_window_type(display, client);
+    update_window_type(display, client, wm);
     update_size_hints(display, client);
     update_wm_hints(display, client);
 
@@ -551,7 +524,7 @@ fn manage(display: *Display, win: xlib.Window, window_attrs: *xlib.XWindowAttrib
         win,
         xlib.EnterWindowMask | xlib.FocusChangeMask | xlib.PropertyChangeMask | xlib.StructureNotifyMask,
     );
-    grabbuttons(display, client, false);
+    grabbuttons(display, client, false, wm);
 
     if (!client.is_floating) {
         client.is_floating = trans != 0 or client.is_fixed;
@@ -564,13 +537,13 @@ fn manage(display: *Display, win: xlib.Window, window_attrs: *xlib.XWindowAttrib
     client_mod.attach_aside(client);
     client_mod.attach_stack(client);
 
-    _ = xlib.XChangeProperty(display.handle, display.root, atoms.net_client_list, xlib.XA_WINDOW, 32, xlib.PropModeAppend, @ptrCast(&client.window), 1);
+    _ = xlib.XChangeProperty(display.handle, display.root, wm.atoms.net_client_list, xlib.XA_WINDOW, 32, xlib.PropModeAppend, @ptrCast(&client.window), 1);
     _ = xlib.XMoveResizeWindow(display.handle, client.window, client.x + 2 * display.screen_width(), client.y, @intCast(client.width), @intCast(client.height));
-    set_client_state(display, client, NormalState);
+    set_client_state(display, client, NormalState, wm);
 
     if (client.monitor == monitor_mod.selected_monitor) {
         const selmon = monitor_mod.selected_monitor orelse return;
-        unfocus_client(display, selmon.sel, false);
+        unfocus_client(display, selmon.sel, false, wm);
     }
     monitor.sel = client;
 
@@ -578,12 +551,13 @@ fn manage(display: *Display, win: xlib.Window, window_attrs: *xlib.XWindowAttrib
         monitor.scroll_offset = 0;
     }
 
-    arrange(monitor);
+    arrange(monitor, wm);
     _ = xlib.XMapWindow(display.handle, win);
-    focus(display, null);
+    focus(display, null, wm);
 }
 
-fn handle_configure_request(display: *Display, event: *xlib.XConfigureRequestEvent) void {
+fn handle_configure_request(display: *Display, event: *xlib.XConfigureRequestEvent, wm: *WindowManager) void {
+    _ = wm;
     const client = client_mod.window_to_client(monitor_mod.monitors, event.window);
 
     if (client) |managed_client| {
@@ -706,7 +680,7 @@ fn execute_action(display: *Display, action: config_mod.Action, int_arg: i32, st
         .spawn => {
             if (str_arg) |cmd| spawn_command(cmd);
         },
-        .kill_client => kill_focused(display),
+        .kill_client => kill_focused(display, wm),
         .quit => {
             std.debug.print("quit keybind pressed\n", .{});
             wm.running = false;
@@ -721,42 +695,42 @@ fn execute_action(display: *Display, action: config_mod.Action, int_arg: i32, st
                 }
             }
         },
-        .focus_next => focusstack(display, 1),
-        .focus_prev => focusstack(display, -1),
-        .move_next => movestack(display, 1),
-        .move_prev => movestack(display, -1),
-        .resize_master => setmfact(@as(f32, @floatFromInt(int_arg)) / 1000.0),
-        .inc_master => incnmaster(1),
-        .dec_master => incnmaster(-1),
-        .toggle_floating => toggle_floating(display),
-        .toggle_fullscreen => toggle_fullscreen(display),
-        .toggle_gaps => toggle_gaps(),
-        .cycle_layout => cycle_layout(),
-        .set_layout => set_layout(str_arg),
-        .set_layout_tiling => set_layout_index(0),
-        .set_layout_floating => set_layout_index(2),
+        .focus_next => focusstack(display, 1, wm),
+        .focus_prev => focusstack(display, -1, wm),
+        .move_next => movestack(display, 1, wm),
+        .move_prev => movestack(display, -1, wm),
+        .resize_master => setmfact(@as(f32, @floatFromInt(int_arg)) / 1000.0, wm),
+        .inc_master => incnmaster(1, wm),
+        .dec_master => incnmaster(-1, wm),
+        .toggle_floating => toggle_floating(display, wm),
+        .toggle_fullscreen => toggle_fullscreen(display, wm),
+        .toggle_gaps => toggle_gaps(wm),
+        .cycle_layout => cycle_layout(wm),
+        .set_layout => set_layout(str_arg, wm),
+        .set_layout_tiling => set_layout_index(0, wm),
+        .set_layout_floating => set_layout_index(2, wm),
         .view_tag => {
             const tag_mask: u32 = @as(u32, 1) << @intCast(int_arg);
-            view(display, tag_mask);
+            view(display, tag_mask, wm);
         },
-        .view_next_tag => view_adjacent_tag(display, 1),
-        .view_prev_tag => view_adjacent_tag(display, -1),
-        .view_next_nonempty_tag => view_adjacent_nonempty_tag(display, 1),
-        .view_prev_nonempty_tag => view_adjacent_nonempty_tag(display, -1),
+        .view_next_tag => view_adjacent_tag(display, 1, wm),
+        .view_prev_tag => view_adjacent_tag(display, -1, wm),
+        .view_next_nonempty_tag => view_adjacent_nonempty_tag(display, 1, wm),
+        .view_prev_nonempty_tag => view_adjacent_nonempty_tag(display, -1, wm),
         .move_to_tag => {
             const tag_mask: u32 = @as(u32, 1) << @intCast(int_arg);
-            tag_client(display, tag_mask);
+            tag_client(display, tag_mask, wm);
         },
         .toggle_view_tag => {
             const tag_mask: u32 = @as(u32, 1) << @intCast(int_arg);
-            toggle_view(display, tag_mask);
+            toggle_view(display, tag_mask, wm);
         },
         .toggle_tag => {
             const tag_mask: u32 = @as(u32, 1) << @intCast(int_arg);
-            toggle_client_tag(display, tag_mask);
+            toggle_client_tag(display, tag_mask, wm);
         },
-        .focus_monitor => focusmon(display, int_arg),
-        .send_to_monitor => sendmon(display, int_arg),
+        .focus_monitor => focusmon(display, int_arg, wm),
+        .send_to_monitor => sendmon(display, int_arg, wm),
         .scroll_left => scroll_layout(-1, wm),
         .scroll_right => scroll_layout(1, wm),
     }
@@ -796,7 +770,7 @@ fn reload_config(display: *Display, wm: *WindowManager) void {
     wm.setup_bars();
     rebuild_bar_blocks(wm);
 
-    grab_keybinds(display);
+    grab_keybinds(display, wm);
 }
 
 fn rebuild_bar_blocks(wm: *WindowManager) void {
@@ -858,7 +832,7 @@ fn spawn_terminal() void {
     }
 }
 
-fn movestack(display: *Display, direction: i32) void {
+fn movestack(display: *Display, direction: i32, wm: *WindowManager) void {
     const monitor = monitor_mod.selected_monitor orelse return;
     const current = monitor.sel orelse return;
 
@@ -915,13 +889,13 @@ fn movestack(display: *Display, direction: i32) void {
     if (target) |swap_client| {
         if (swap_client != current) {
             client_mod.swap_clients(current, swap_client);
-            arrange(monitor);
-            focus(display, current);
+            arrange(monitor, wm);
+            focus(display, current, wm);
         }
     }
 }
 
-fn toggle_view(display: *Display, tag_mask: u32) void {
+fn toggle_view(display: *Display, tag_mask: u32, wm: *WindowManager) void {
     const monitor = monitor_mod.selected_monitor orelse return;
     const new_tags = monitor.tagset[monitor.sel_tags] ^ tag_mask;
     if (new_tags != 0) {
@@ -945,25 +919,25 @@ fn toggle_view(display: *Display, tag_mask: u32) void {
         monitor.mfact = monitor.pertag.mfacts[monitor.pertag.curtag];
         monitor.sel_lt = monitor.pertag.sellts[monitor.pertag.curtag];
 
-        focus_top_client(display, monitor);
-        arrange(monitor);
-        if (wm_ptr) |wm| wm.invalidate_bars();
+        focus_top_client(display, monitor, wm);
+        arrange(monitor, wm);
+        wm.invalidate_bars();
     }
 }
 
-fn toggle_client_tag(display: *Display, tag_mask: u32) void {
+fn toggle_client_tag(display: *Display, tag_mask: u32, wm: *WindowManager) void {
     const monitor = monitor_mod.selected_monitor orelse return;
     const client = monitor.sel orelse return;
     const new_tags = client.tags ^ tag_mask;
     if (new_tags != 0) {
         client.tags = new_tags;
-        focus_top_client(display, monitor);
-        arrange(monitor);
-        if (wm_ptr) |wm| wm.invalidate_bars();
+        focus_top_client(display, monitor, wm);
+        arrange(monitor, wm);
+        wm.invalidate_bars();
     }
 }
 
-fn toggle_gaps() void {
+fn toggle_gaps(wm: *WindowManager) void {
     const monitor = monitor_mod.selected_monitor orelse return;
     if (monitor.gap_inner_h == 0) {
         monitor.gap_inner_h = config.gap_inner_h;
@@ -976,15 +950,15 @@ fn toggle_gaps() void {
         monitor.gap_outer_h = 0;
         monitor.gap_outer_v = 0;
     }
-    arrange(monitor);
+    arrange(monitor, wm);
 }
 
-fn kill_focused(display: *Display) void {
+fn kill_focused(display: *Display, wm: *WindowManager) void {
     const selected = monitor_mod.selected_monitor orelse return;
     const client = selected.sel orelse return;
     std.debug.print("killing window: 0x{x}\n", .{client.window});
 
-    if (!send_event(display, client, atoms.wm_delete)) {
+    if (!send_event(display, client, wm.atoms.wm_delete, wm)) {
         _ = xlib.XGrabServer(display.handle);
         _ = xlib.XKillClient(display.handle, client.window);
         _ = xlib.XSync(display.handle, xlib.False);
@@ -992,21 +966,21 @@ fn kill_focused(display: *Display) void {
     }
 }
 
-fn toggle_fullscreen(display: *Display) void {
+fn toggle_fullscreen(display: *Display, wm: *WindowManager) void {
     const selected = monitor_mod.selected_monitor orelse return;
     const client = selected.sel orelse return;
-    set_fullscreen(display, client, !client.is_fullscreen);
+    set_fullscreen(display, client, !client.is_fullscreen, wm);
 }
 
-fn set_fullscreen(display: *Display, client: *Client, fullscreen: bool) void {
+fn set_fullscreen(display: *Display, client: *Client, fullscreen: bool, wm: *WindowManager) void {
     const monitor = client.monitor orelse return;
 
     if (fullscreen and !client.is_fullscreen) {
-        var fullscreen_atom = atoms.net_wm_state_fullscreen;
+        var fullscreen_atom = wm.atoms.net_wm_state_fullscreen;
         _ = xlib.XChangeProperty(
             display.handle,
             client.window,
-            atoms.net_wm_state,
+            wm.atoms.net_wm_state,
             xlib.XA_ATOM,
             32,
             xlib.PropModeReplace,
@@ -1029,7 +1003,7 @@ fn set_fullscreen(display: *Display, client: *Client, fullscreen: bool) void {
         _ = xlib.XChangeProperty(
             display.handle,
             client.window,
-            atoms.net_wm_state,
+            wm.atoms.net_wm_state,
             xlib.XA_ATOM,
             32,
             xlib.PropModeReplace,
@@ -1046,13 +1020,13 @@ fn set_fullscreen(display: *Display, client: *Client, fullscreen: bool) void {
         client.height = client.old_height;
 
         tiling.resize_client(client, client.x, client.y, client.width, client.height);
-        arrange(monitor);
+        arrange(monitor, wm);
 
         std.debug.print("fullscreen disabled: window=0x{x}\n", .{client.window});
     }
 }
 
-fn view(display: *Display, tag_mask: u32) void {
+fn view(display: *Display, tag_mask: u32, wm: *WindowManager) void {
     const monitor = monitor_mod.selected_monitor orelse return;
     if (tag_mask == monitor.tagset[monitor.sel_tags]) {
         return;
@@ -1081,13 +1055,13 @@ fn view(display: *Display, tag_mask: u32) void {
     monitor.mfact = monitor.pertag.mfacts[monitor.pertag.curtag];
     monitor.sel_lt = monitor.pertag.sellts[monitor.pertag.curtag];
 
-    focus_top_client(display, monitor);
-    arrange(monitor);
-    if (wm_ptr) |wm| wm.invalidate_bars();
+    focus_top_client(display, monitor, wm);
+    arrange(monitor, wm);
+    wm.invalidate_bars();
     std.debug.print("view: tag_mask={d}\n", .{monitor.tagset[monitor.sel_tags]});
 }
 
-fn view_adjacent_tag(display: *Display, direction: i32) void {
+fn view_adjacent_tag(display: *Display, direction: i32, wm: *WindowManager) void {
     const monitor = monitor_mod.selected_monitor orelse return;
     const current_tag = monitor.pertag.curtag;
     var new_tag: i32 = @intCast(current_tag);
@@ -1097,10 +1071,10 @@ fn view_adjacent_tag(display: *Display, direction: i32) void {
     if (new_tag > 9) new_tag = 1;
 
     const tag_mask: u32 = @as(u32, 1) << @intCast(new_tag - 1);
-    view(display, tag_mask);
+    view(display, tag_mask, wm);
 }
 
-fn view_adjacent_nonempty_tag(display: *Display, direction: i32) void {
+fn view_adjacent_nonempty_tag(display: *Display, direction: i32, wm: *WindowManager) void {
     const monitor = monitor_mod.selected_monitor orelse return;
     const current_tag = monitor.pertag.curtag;
     var new_tag: i32 = @intCast(current_tag);
@@ -1113,7 +1087,7 @@ fn view_adjacent_nonempty_tag(display: *Display, direction: i32) void {
 
         const tag_mask: u32 = @as(u32, 1) << @intCast(new_tag - 1);
         if (has_clients_on_tag(monitor, tag_mask)) {
-            view(display, tag_mask);
+            view(display, tag_mask, wm);
             return;
         }
     }
@@ -1130,24 +1104,24 @@ fn has_clients_on_tag(monitor: *monitor_mod.Monitor, tag_mask: u32) bool {
     return false;
 }
 
-fn tag_client(display: *Display, tag_mask: u32) void {
+fn tag_client(display: *Display, tag_mask: u32, wm: *WindowManager) void {
     const monitor = monitor_mod.selected_monitor orelse return;
     const client = monitor.sel orelse return;
     if (tag_mask == 0) {
         return;
     }
     client.tags = tag_mask;
-    focus_top_client(display, monitor);
-    arrange(monitor);
-    if (wm_ptr) |wm| wm.invalidate_bars();
+    focus_top_client(display, monitor, wm);
+    arrange(monitor, wm);
+    wm.invalidate_bars();
     std.debug.print("tag_client: window=0x{x} tag_mask={d}\n", .{ client.window, tag_mask });
 }
 
-fn focus_top_client(display: *Display, monitor: *Monitor) void {
+fn focus_top_client(display: *Display, monitor: *Monitor, wm: *WindowManager) void {
     var visible_client = monitor.stack;
     while (visible_client) |client| {
         if (client_mod.is_visible(client)) {
-            focus(display, client);
+            focus(display, client, wm);
             return;
         }
         visible_client = client.stack_next;
@@ -1156,7 +1130,7 @@ fn focus_top_client(display: *Display, monitor: *Monitor) void {
     _ = xlib.XSetInputFocus(display.handle, display.root, xlib.RevertToPointerRoot, xlib.CurrentTime);
 }
 
-fn focusstack(display: *Display, direction: i32) void {
+fn focusstack(display: *Display, direction: i32, wm: *WindowManager) void {
     const monitor = monitor_mod.selected_monitor orelse return;
     const current = monitor.sel orelse return;
 
@@ -1204,14 +1178,14 @@ fn focusstack(display: *Display, direction: i32) void {
     }
 
     if (next_client) |client| {
-        focus(display, client);
+        focus(display, client, wm);
         if (client.monitor) |client_monitor| {
-            restack(display, client_monitor);
+            restack(display, client_monitor, wm);
         }
     }
 }
 
-fn toggle_floating(_: *Display) void {
+fn toggle_floating(_: *Display, wm: *WindowManager) void {
     const monitor = monitor_mod.selected_monitor orelse return;
     const client = monitor.sel orelse return;
 
@@ -1225,20 +1199,20 @@ fn toggle_floating(_: *Display) void {
         tiling.resize(client, client.x, client.y, client.width, client.height, false);
     }
 
-    arrange(monitor);
+    arrange(monitor, wm);
     std.debug.print("toggle_floating: window=0x{x} floating={}\n", .{ client.window, client.is_floating });
 }
 
-fn incnmaster(delta: i32) void {
+fn incnmaster(delta: i32, wm: *WindowManager) void {
     const monitor = monitor_mod.selected_monitor orelse return;
     const new_val = @max(0, monitor.nmaster + delta);
     monitor.nmaster = new_val;
     monitor.pertag.nmasters[monitor.pertag.curtag] = new_val;
-    arrange(monitor);
+    arrange(monitor, wm);
     std.debug.print("incnmaster: nmaster={d}\n", .{monitor.nmaster});
 }
 
-fn setmfact(delta: f32) void {
+fn setmfact(delta: f32, wm: *WindowManager) void {
     const monitor = monitor_mod.selected_monitor orelse return;
     const new_mfact = monitor.mfact + delta;
     if (new_mfact < 0.05 or new_mfact > 0.95) {
@@ -1246,11 +1220,11 @@ fn setmfact(delta: f32) void {
     }
     monitor.mfact = new_mfact;
     monitor.pertag.mfacts[monitor.pertag.curtag] = new_mfact;
-    arrange(monitor);
+    arrange(monitor, wm);
     std.debug.print("setmfact: mfact={d:.2}\n", .{monitor.mfact});
 }
 
-fn cycle_layout() void {
+fn cycle_layout(wm: *WindowManager) void {
     const monitor = monitor_mod.selected_monitor orelse return;
     const new_lt = (monitor.sel_lt + 1) % 5;
     monitor.sel_lt = new_lt;
@@ -1258,14 +1232,14 @@ fn cycle_layout() void {
     if (new_lt != 3) {
         monitor.scroll_offset = 0;
     }
-    arrange(monitor);
-    if (wm_ptr) |wm| wm.invalidate_bars();
+    arrange(monitor, wm);
+    wm.invalidate_bars();
     if (monitor.lt[monitor.sel_lt]) |layout| {
         std.debug.print("cycle_layout: {s}\n", .{layout.symbol});
     }
 }
 
-fn set_layout(layout_name: ?[]const u8) void {
+fn set_layout(layout_name: ?[]const u8, wm: *WindowManager) void {
     const monitor = monitor_mod.selected_monitor orelse return;
     const name = layout_name orelse return;
 
@@ -1289,40 +1263,40 @@ fn set_layout(layout_name: ?[]const u8) void {
     if (new_lt != 3) {
         monitor.scroll_offset = 0;
     }
-    arrange(monitor);
-    if (wm_ptr) |wm| wm.invalidate_bars();
+    arrange(monitor, wm);
+    wm.invalidate_bars();
     if (monitor.lt[monitor.sel_lt]) |layout| {
         std.debug.print("set_layout: {s}\n", .{layout.symbol});
     }
 }
 
-fn set_layout_index(index: u32) void {
+fn set_layout_index(index: u32, wm: *WindowManager) void {
     const monitor = monitor_mod.selected_monitor orelse return;
     monitor.sel_lt = index;
     monitor.pertag.sellts[monitor.pertag.curtag] = index;
     if (index != 3) {
         monitor.scroll_offset = 0;
     }
-    arrange(monitor);
-    if (wm_ptr) |wm| wm.invalidate_bars();
+    arrange(monitor, wm);
+    wm.invalidate_bars();
     if (monitor.lt[monitor.sel_lt]) |layout| {
         std.debug.print("set_layout_index: {s}\n", .{layout.symbol});
     }
 }
 
-fn focusmon(display: *Display, direction: i32) void {
+fn focusmon(display: *Display, direction: i32, wm: *WindowManager) void {
     const selmon = monitor_mod.selected_monitor orelse return;
     const target = monitor_mod.dir_to_monitor(direction) orelse return;
     if (target == selmon) {
         return;
     }
-    unfocus_client(display, selmon.sel, false);
+    unfocus_client(display, selmon.sel, false, wm);
     monitor_mod.selected_monitor = target;
-    focus(display, null);
+    focus(display, null, wm);
     std.debug.print("focusmon: monitor {d}\n", .{target.num});
 }
 
-fn sendmon(display: *Display, direction: i32) void {
+fn sendmon(display: *Display, direction: i32, wm: *WindowManager) void {
     const source_monitor = monitor_mod.selected_monitor orelse return;
     const client = source_monitor.sel orelse return;
     const target = monitor_mod.dir_to_monitor(direction) orelse return;
@@ -1338,9 +1312,9 @@ fn sendmon(display: *Display, direction: i32) void {
     client_mod.attach_aside(client);
     client_mod.attach_stack(client);
 
-    focus_top_client(display, source_monitor);
-    arrange(source_monitor);
-    arrange(target);
+    focus_top_client(display, source_monitor, wm);
+    arrange(source_monitor, wm);
+    arrange(target, wm);
 
     std.debug.print("sendmon: window=0x{x} to monitor {d}\n", .{ client.window, target.num });
 }
@@ -1373,7 +1347,7 @@ fn movemouse(display: *Display, wm: *WindowManager) void {
         return;
     }
 
-    restack(display, monitor);
+    restack(display, monitor, wm);
 
     const was_floating = client.is_floating;
     if (!client.is_floating) {
@@ -1451,11 +1425,11 @@ fn movemouse(display: *Display, wm: *WindowManager) void {
         client_mod.attach_aside(client);
         client_mod.attach_stack(client);
         monitor_mod.selected_monitor = new_mon;
-        focus(display, client);
-        arrange(monitor);
-        arrange(new_mon.?);
+        focus(display, client, wm);
+        arrange(monitor, wm);
+        arrange(new_mon.?, wm);
     } else {
-        arrange(monitor);
+        arrange(monitor, wm);
     }
 
     if (config.auto_tile and !was_floating) {
@@ -1468,7 +1442,7 @@ fn movemouse(display: *Display, wm: *WindowManager) void {
         }
 
         client.is_floating = false;
-        arrange(drop_monitor);
+        arrange(drop_monitor, wm);
     }
 }
 
@@ -1480,7 +1454,7 @@ fn resizemouse(display: *Display, wm: *WindowManager) void {
         return;
     }
 
-    restack(display, monitor);
+    restack(display, monitor, wm);
 
     if (!client.is_floating) {
         client.is_floating = true;
@@ -1542,7 +1516,7 @@ fn resizemouse(display: *Display, wm: *WindowManager) void {
     }
 
     _ = xlib.XUngrabPointer(display.handle, xlib.CurrentTime);
-    arrange(monitor);
+    arrange(monitor, wm);
 }
 
 fn handle_expose(display: *Display, event: *xlib.XExposeEvent, wm: *WindowManager) void {
@@ -1553,7 +1527,7 @@ fn handle_expose(display: *Display, event: *xlib.XExposeEvent, wm: *WindowManage
     }
 }
 
-fn clean_mask(mask: c_uint) c_uint {
+fn clean_mask(mask: c_uint, wm: *WindowManager) c_uint {
     const lock: c_uint = @intCast(xlib.LockMask);
     const shift: c_uint = @intCast(xlib.ShiftMask);
     const ctrl: c_uint = @intCast(xlib.ControlMask);
@@ -1562,7 +1536,7 @@ fn clean_mask(mask: c_uint) c_uint {
     const mod3: c_uint = @intCast(xlib.Mod3Mask);
     const mod4: c_uint = @intCast(xlib.Mod4Mask);
     const mod5: c_uint = @intCast(xlib.Mod5Mask);
-    return mask & ~(lock | numlock_mask) & (shift | ctrl | mod1 | mod2 | mod3 | mod4 | mod5);
+    return mask & ~(lock | wm.numlock_mask) & (shift | ctrl | mod1 | mod2 | mod3 | mod4 | mod5);
 }
 
 fn handle_button_press(display: *Display, event: *xlib.XButtonEvent, wm: *WindowManager) void {
@@ -1572,10 +1546,10 @@ fn handle_button_press(display: *Display, event: *xlib.XButtonEvent, wm: *Window
     if (clicked_monitor) |monitor| {
         if (monitor != monitor_mod.selected_monitor) {
             if (monitor_mod.selected_monitor) |selmon| {
-                unfocus_client(display, selmon.sel, true);
+                unfocus_client(display, selmon.sel, true, wm);
             }
             monitor_mod.selected_monitor = monitor;
-            focus(display, null);
+            focus(display, null, wm);
         }
     }
 
@@ -1583,24 +1557,24 @@ fn handle_button_press(display: *Display, event: *xlib.XButtonEvent, wm: *Window
         const clicked_tag = bar.handle_click(display.handle, event.x, wm.config);
         if (clicked_tag) |tag_index| {
             const tag_mask: u32 = @as(u32, 1) << @intCast(tag_index);
-            view(display, tag_mask);
+            view(display, tag_mask, wm);
         }
         return;
     }
 
     const click_client = client_mod.window_to_client(monitor_mod.monitors, event.window);
     if (click_client) |found_client| {
-        focus(display, found_client);
+        focus(display, found_client, wm);
         if (monitor_mod.selected_monitor) |selmon| {
-            restack(display, selmon);
+            restack(display, selmon, wm);
         }
         _ = xlib.XAllowEvents(display.handle, xlib.ReplayPointer, xlib.CurrentTime);
     }
 
-    const clean_state = clean_mask(event.state);
+    const clean_state = clean_mask(event.state, wm);
     for (config.buttons.items) |button| {
         if (button.click != .client_win) continue;
-        const button_clean_mask = clean_mask(button.mod_mask);
+        const button_clean_mask = clean_mask(button.mod_mask, wm);
         if (clean_state == button_clean_mask and event.button == button.button) {
             switch (button.action) {
                 .move_mouse => movemouse(display, wm),
@@ -1609,7 +1583,7 @@ fn handle_button_press(display: *Display, event: *xlib.XButtonEvent, wm: *Window
                     if (click_client) |found_client| {
                         found_client.is_floating = !found_client.is_floating;
                         if (monitor_mod.selected_monitor) |monitor| {
-                            arrange(monitor);
+                            arrange(monitor, wm);
                         }
                     }
                 },
@@ -1619,28 +1593,28 @@ fn handle_button_press(display: *Display, event: *xlib.XButtonEvent, wm: *Window
     }
 }
 
-fn handle_client_message(display: *Display, event: *xlib.XClientMessageEvent) void {
+fn handle_client_message(display: *Display, event: *xlib.XClientMessageEvent, wm: *WindowManager) void {
     const client = client_mod.window_to_client(monitor_mod.monitors, event.window) orelse return;
 
-    if (event.message_type == atoms.net_wm_state) {
+    if (event.message_type == wm.atoms.net_wm_state) {
         const action = event.data.l[0];
         const first_property = @as(xlib.Atom, @intCast(event.data.l[1]));
         const second_property = @as(xlib.Atom, @intCast(event.data.l[2]));
 
-        if (first_property == atoms.net_wm_state_fullscreen or second_property == atoms.net_wm_state_fullscreen) {
+        if (first_property == wm.atoms.net_wm_state_fullscreen or second_property == wm.atoms.net_wm_state_fullscreen) {
             const net_wm_state_remove = 0;
             const net_wm_state_add = 1;
             const net_wm_state_toggle = 2;
 
             if (action == net_wm_state_add) {
-                set_fullscreen(display, client, true);
+                set_fullscreen(display, client, true, wm);
             } else if (action == net_wm_state_remove) {
-                set_fullscreen(display, client, false);
+                set_fullscreen(display, client, false, wm);
             } else if (action == net_wm_state_toggle) {
-                set_fullscreen(display, client, !client.is_fullscreen);
+                set_fullscreen(display, client, !client.is_fullscreen, wm);
             }
         }
-    } else if (event.message_type == atoms.net_active_window) {
+    } else if (event.message_type == wm.atoms.net_active_window) {
         const selected = monitor_mod.selected_monitor orelse return;
         if (client != selected.sel and !client.is_urgent) {
             set_urgent(display, client, true);
@@ -1648,19 +1622,19 @@ fn handle_client_message(display: *Display, event: *xlib.XClientMessageEvent) vo
     }
 }
 
-fn handle_destroy_notify(display: *Display, event: *xlib.XDestroyWindowEvent) void {
+fn handle_destroy_notify(display: *Display, event: *xlib.XDestroyWindowEvent, wm: *WindowManager) void {
     const client = client_mod.window_to_client(monitor_mod.monitors, event.window) orelse return;
     std.debug.print("destroy_notify: window=0x{x}\n", .{event.window});
-    unmanage(display, client);
+    unmanage(display, client, wm);
 }
 
-fn handle_unmap_notify(display: *Display, event: *xlib.XUnmapEvent) void {
+fn handle_unmap_notify(display: *Display, event: *xlib.XUnmapEvent, wm: *WindowManager) void {
     const client = client_mod.window_to_client(monitor_mod.monitors, event.window) orelse return;
     std.debug.print("unmap_notify: window=0x{x}\n", .{event.window});
-    unmanage(display, client);
+    unmanage(display, client, wm);
 }
 
-fn unmanage(display: *Display, client: *Client) void {
+fn unmanage(display: *Display, client: *Client, wm: *WindowManager) void {
     const client_monitor = client.monitor;
 
     var next_focus: ?*Client = null;
@@ -1695,22 +1669,21 @@ fn unmanage(display: *Display, client: *Client) void {
                 monitor.scroll_offset = 0;
             }
         }
-        arrange(monitor);
+        arrange(monitor, wm);
     }
 
     if (client_monitor) |monitor| {
         if (monitor.sel) |selected| {
-            focus(display, selected);
+            focus(display, selected, wm);
         }
     }
 
     client_mod.destroy(gpa.allocator(), client);
-    update_client_list(display);
-    if (wm_ptr) |wm| wm.invalidate_bars();
+    update_client_list(display, wm);
+    wm.invalidate_bars();
 }
 
 fn handle_enter_notify(display: *Display, event: *xlib.XCrossingEvent, wm: *WindowManager) void {
-    _ = wm;
     if ((event.mode != xlib.NotifyNormal or event.detail == xlib.NotifyInferior) and event.window != display.root) {
         return;
     }
@@ -1721,7 +1694,7 @@ fn handle_enter_notify(display: *Display, event: *xlib.XCrossingEvent, wm: *Wind
 
     if (target_mon != selmon) {
         if (selmon) |sel| {
-            unfocus_client(display, sel.sel, true);
+            unfocus_client(display, sel.sel, true, wm);
         }
         monitor_mod.selected_monitor = target_mon;
     } else if (client == null) {
@@ -1732,23 +1705,23 @@ fn handle_enter_notify(display: *Display, event: *xlib.XCrossingEvent, wm: *Wind
         }
     }
 
-    focus(display, client);
+    focus(display, client, wm);
 }
 
-fn handle_focus_in(display: *Display, event: *xlib.XFocusChangeEvent) void {
+fn handle_focus_in(display: *Display, event: *xlib.XFocusChangeEvent, wm: *WindowManager) void {
     const selmon = monitor_mod.selected_monitor orelse return;
     const selected = selmon.sel orelse return;
     if (event.window != selected.window) {
-        set_focus(display, selected);
+        set_focus(display, selected, wm);
     }
 }
 
-fn set_focus(display: *Display, client: *Client) void {
+fn set_focus(display: *Display, client: *Client, wm: *WindowManager) void {
     if (!client.never_focus) {
         _ = xlib.XSetInputFocus(display.handle, client.window, xlib.RevertToPointerRoot, xlib.CurrentTime);
-        _ = xlib.XChangeProperty(display.handle, display.root, atoms.net_active_window, xlib.XA_WINDOW, 32, xlib.PropModeReplace, @ptrCast(&client.window), 1);
+        _ = xlib.XChangeProperty(display.handle, display.root, wm.atoms.net_active_window, xlib.XA_WINDOW, 32, xlib.PropModeReplace, @ptrCast(&client.window), 1);
     }
-    _ = send_event(display, client, atoms.wm_take_focus);
+    _ = send_event(display, client, wm.atoms.wm_take_focus, wm);
 }
 
 fn handle_motion_notify(display: *Display, event: *xlib.XMotionEvent, wm: *WindowManager) void {
@@ -1757,15 +1730,15 @@ fn handle_motion_notify(display: *Display, event: *xlib.XMotionEvent, wm: *Windo
     const target_mon = monitor_mod.rect_to_monitor(event.x_root, event.y_root, 1, 1);
     if (target_mon != wm.last_motion_monitor and wm.last_motion_monitor != null) {
         if (monitor_mod.selected_monitor) |selmon| {
-            unfocus_client(display, selmon.sel, true);
+            unfocus_client(display, selmon.sel, true, wm);
         }
         monitor_mod.selected_monitor = target_mon;
-        focus(display, null);
+        focus(display, null, wm);
     }
     wm.last_motion_monitor = target_mon;
 }
 
-fn handle_property_notify(display: *Display, event: *xlib.XPropertyEvent) void {
+fn handle_property_notify(display: *Display, event: *xlib.XPropertyEvent, wm: *WindowManager) void {
     if (event.state == xlib.PropertyDelete) {
         return;
     }
@@ -1778,7 +1751,7 @@ fn handle_property_notify(display: *Display, event: *xlib.XPropertyEvent) void {
             client.is_floating = client_mod.window_to_client(monitor_mod.monitors, trans) != null;
             if (client.is_floating) {
                 if (client.monitor) |monitor| {
-                    arrange(monitor);
+                    arrange(monitor, wm);
                 }
             }
         }
@@ -1786,31 +1759,31 @@ fn handle_property_notify(display: *Display, event: *xlib.XPropertyEvent) void {
         client.hints_valid = false;
     } else if (event.atom == xlib.XA_WM_HINTS) {
         update_wm_hints(display, client);
-        if (wm_ptr) |wm| wm.invalidate_bars();
-    } else if (event.atom == xlib.XA_WM_NAME or event.atom == atoms.net_wm_name) {
-        update_title(display, client);
-    } else if (event.atom == atoms.net_wm_window_type) {
-        update_window_type(display, client);
+        wm.invalidate_bars();
+    } else if (event.atom == xlib.XA_WM_NAME or event.atom == wm.atoms.net_wm_name) {
+        update_title(display, client, wm);
+    } else if (event.atom == wm.atoms.net_wm_window_type) {
+        update_window_type(display, client, wm);
     }
 }
 
-fn unfocus_client(display: *Display, client: ?*Client, reset_input_focus: bool) void {
+fn unfocus_client(display: *Display, client: ?*Client, reset_input_focus: bool, wm: *WindowManager) void {
     const unfocus_target = client orelse return;
-    grabbuttons(display, unfocus_target, false);
+    grabbuttons(display, unfocus_target, false, wm);
     _ = xlib.XSetWindowBorder(display.handle, unfocus_target.window, config.border_unfocused);
     if (reset_input_focus) {
         _ = xlib.XSetInputFocus(display.handle, display.root, xlib.RevertToPointerRoot, xlib.CurrentTime);
-        _ = xlib.XDeleteProperty(display.handle, display.root, atoms.net_active_window);
+        _ = xlib.XDeleteProperty(display.handle, display.root, wm.atoms.net_active_window);
     }
 }
 
-fn set_client_state(display: *Display, client: *Client, state: c_long) void {
+fn set_client_state(display: *Display, client: *Client, state: c_long, wm: *WindowManager) void {
     var data: [2]c_long = .{ state, xlib.None };
-    _ = xlib.c.XChangeProperty(display.handle, client.window, atoms.wm_state, xlib.XA_ATOM, 32, xlib.PropModeReplace, @ptrCast(&data), 2);
+    _ = xlib.c.XChangeProperty(display.handle, client.window, wm.atoms.wm_state, xlib.XA_ATOM, 32, xlib.PropModeReplace, @ptrCast(&data), 2);
 }
 
-fn update_numlock_mask(display: *Display) void {
-    numlock_mask = 0;
+fn update_numlock_mask(display: *Display, wm: *WindowManager) void {
+    wm.numlock_mask = 0;
     const modmap = xlib.XGetModifierMapping(display.handle);
     if (modmap == null) return;
     defer _ = xlib.XFreeModifiermap(modmap);
@@ -1823,15 +1796,15 @@ fn update_numlock_mask(display: *Display) void {
         while (key_index < @as(usize, @intCast(modmap.*.max_keypermod))) : (key_index += 1) {
             const keycode = modmap.*.modifiermap[modifier_index * @as(usize, @intCast(modmap.*.max_keypermod)) + key_index];
             if (keycode == numlock_keycode) {
-                numlock_mask = @as(c_uint, 1) << @intCast(modifier_index);
+                wm.numlock_mask = @as(c_uint, 1) << @intCast(modifier_index);
             }
         }
     }
 }
 
-fn grabbuttons(display: *Display, client: *Client, focused: bool) void {
-    update_numlock_mask(display);
-    const modifiers = [_]c_uint{ 0, xlib.LockMask, numlock_mask, numlock_mask | xlib.LockMask };
+fn grabbuttons(display: *Display, client: *Client, focused: bool, wm: *WindowManager) void {
+    update_numlock_mask(display, wm);
+    const modifiers = [_]c_uint{ 0, xlib.LockMask, wm.numlock_mask, wm.numlock_mask | xlib.LockMask };
 
     _ = xlib.XUngrabButton(display.handle, xlib.AnyButton, xlib.AnyModifier, client.window);
     if (!focused) {
@@ -1868,7 +1841,7 @@ fn grabbuttons(display: *Display, client: *Client, focused: bool) void {
     }
 }
 
-fn focus(display: *Display, target_client: ?*Client) void {
+fn focus(display: *Display, target_client: ?*Client, wm: *WindowManager) void {
     const selmon = monitor_mod.selected_monitor orelse return;
 
     var focus_client = target_client;
@@ -1881,7 +1854,7 @@ fn focus(display: *Display, target_client: ?*Client) void {
     }
 
     if (selmon.sel != null and selmon.sel != focus_client) {
-        unfocus_client(display, selmon.sel, false);
+        unfocus_client(display, selmon.sel, false, wm);
     }
 
     if (focus_client) |client| {
@@ -1893,16 +1866,16 @@ fn focus(display: *Display, target_client: ?*Client) void {
         }
         client_mod.detach_stack(client);
         client_mod.attach_stack(client);
-        grabbuttons(display, client, true);
+        grabbuttons(display, client, true, wm);
         _ = xlib.XSetWindowBorder(display.handle, client.window, config.border_focused);
         if (!client.never_focus) {
             _ = xlib.XSetInputFocus(display.handle, client.window, xlib.RevertToPointerRoot, xlib.CurrentTime);
-            _ = xlib.XChangeProperty(display.handle, display.root, atoms.net_active_window, xlib.XA_WINDOW, 32, xlib.PropModeReplace, @ptrCast(&client.window), 1);
+            _ = xlib.XChangeProperty(display.handle, display.root, wm.atoms.net_active_window, xlib.XA_WINDOW, 32, xlib.PropModeReplace, @ptrCast(&client.window), 1);
         }
-        _ = send_event(display, client, atoms.wm_take_focus);
+        _ = send_event(display, client, wm.atoms.wm_take_focus, wm);
     } else {
         _ = xlib.XSetInputFocus(display.handle, display.root, xlib.RevertToPointerRoot, xlib.CurrentTime);
-        _ = xlib.XDeleteProperty(display.handle, display.root, atoms.net_active_window);
+        _ = xlib.XDeleteProperty(display.handle, display.root, wm.atoms.net_active_window);
     }
 
     const current_selmon = monitor_mod.selected_monitor orelse return;
@@ -1910,15 +1883,15 @@ fn focus(display: *Display, target_client: ?*Client) void {
 
     if (focus_client) |client| {
         if (is_scrolling_layout(current_selmon)) {
-            scroll_to_window(client, true, wm_ptr orelse return);
+            scroll_to_window(client, true, wm);
         }
     }
 
-    if (wm_ptr) |wm| wm.invalidate_bars();
+    wm.invalidate_bars();
 }
 
-fn restack(display: *Display, monitor: *Monitor) void {
-    if (wm_ptr) |wm| wm.invalidate_bars();
+fn restack(display: *Display, monitor: *Monitor, wm: *WindowManager) void {
+    wm.invalidate_bars();
     const selected_client = monitor.sel orelse return;
 
     if (selected_client.is_floating or monitor.lt[monitor.sel_lt] == null) {
@@ -1946,20 +1919,14 @@ fn restack(display: *Display, monitor: *Monitor) void {
     while (xlib.c.XCheckMaskEvent(display.handle, xlib.EnterWindowMask, &discard_event) != 0) {}
 }
 
-fn arrange(monitor: *Monitor) void {
-    // TODO(wm-refactor): display will become a WindowManager field; for now
-    // we use a module-level pointer set once after the display is opened.
-    if (wm_display) |display| {
-        showhide(display, monitor);
-    }
+fn arrange(monitor: *Monitor, wm: *WindowManager) void {
+    showhide(&wm.display, monitor, wm);
     if (monitor.lt[monitor.sel_lt]) |layout| {
         if (layout.arrange_fn) |arrange_fn| {
             arrange_fn(monitor);
         }
     }
-    if (wm_display) |display| {
-        restack(display, monitor);
-    }
+    restack(&wm.display, monitor, wm);
 }
 
 fn tick_animations(wm: *WindowManager) void {
@@ -1968,7 +1935,7 @@ fn tick_animations(wm: *WindowManager) void {
     const monitor = wm.selected_monitor orelse return;
     if (wm.scroll_animation.update()) |new_offset| {
         monitor.scroll_offset = new_offset;
-        arrange(monitor);
+        arrange(monitor, wm);
     }
 }
 
@@ -2007,11 +1974,11 @@ fn scroll_to_window(client: *Client, animate: bool, wm: *WindowManager) void {
         wm.scroll_animation.start(monitor.scroll_offset, target, wm.animation_config);
     } else {
         monitor.scroll_offset = target;
-        arrange(monitor);
+        arrange(monitor, wm);
     }
 }
 
-fn showhide_client(display: *Display, client: ?*Client) void {
+fn showhide_client(display: *Display, client: ?*Client, wm: *WindowManager) void {
     const target = client orelse return;
     if (client_mod.is_visible(target)) {
         _ = xlib.XMoveWindow(display.handle, target.window, target.x, target.y);
@@ -2019,16 +1986,16 @@ fn showhide_client(display: *Display, client: ?*Client) void {
         if ((monitor.lt[monitor.sel_lt] == null or target.is_floating) and !target.is_fullscreen) {
             tiling.resize(target, target.x, target.y, target.width, target.height, false);
         }
-        showhide_client(display, target.stack_next);
+        showhide_client(display, target.stack_next, wm);
     } else {
-        showhide_client(display, target.stack_next);
+        showhide_client(display, target.stack_next, wm);
         const client_width = target.width + 2 * target.border_width;
         _ = xlib.XMoveWindow(display.handle, target.window, -2 * client_width, target.y);
     }
 }
 
-fn showhide(display: *Display, monitor: *Monitor) void {
-    showhide_client(display, monitor.stack);
+fn showhide(display: *Display, monitor: *Monitor, wm: *WindowManager) void {
+    showhide_client(display, monitor.stack, wm);
 }
 
 fn update_size_hints(display: *Display, client: *Client) void {
@@ -2109,20 +2076,20 @@ fn update_wm_hints(display: *Display, client: *Client) void {
     }
 }
 
-fn update_window_type(display: *Display, client: *Client) void {
-    const state = get_atom_prop(display, client, atoms.net_wm_state);
-    const window_type = get_atom_prop(display, client, atoms.net_wm_window_type);
+fn update_window_type(display: *Display, client: *Client, wm: *WindowManager) void {
+    const state = get_atom_prop(display, client, wm.atoms.net_wm_state);
+    const window_type = get_atom_prop(display, client, wm.atoms.net_wm_window_type);
 
-    if (state == atoms.net_wm_state_fullscreen) {
-        set_fullscreen(display, client, true);
+    if (state == wm.atoms.net_wm_state_fullscreen) {
+        set_fullscreen(display, client, true, wm);
     }
-    if (window_type == atoms.net_wm_window_type_dialog) {
+    if (window_type == wm.atoms.net_wm_window_type_dialog) {
         client.is_floating = true;
     }
 }
 
-fn update_title(display: *Display, client: *Client) void {
-    if (!get_text_prop(display, client.window, atoms.net_wm_name, &client.name)) {
+fn update_title(display: *Display, client: *Client, wm: *WindowManager) void {
+    if (!get_text_prop(display, client.window, wm.atoms.net_wm_name, &client.name)) {
         _ = get_text_prop(display, client.window, xlib.XA_WM_NAME, &client.name);
     }
     if (client.name[0] == 0) {
@@ -2173,7 +2140,7 @@ fn get_text_prop(display: *Display, window: xlib.Window, atom: xlib.Atom, text: 
     return true;
 }
 
-fn apply_rules(display: *Display, client: *Client) void {
+fn apply_rules(display: *Display, client: *Client, wm: *WindowManager) void {
     var class_hint: xlib.XClassHint = .{ .res_name = null, .res_class = null };
     _ = xlib.XGetClassHint(display.handle, client.window, &class_hint);
 
@@ -2226,26 +2193,26 @@ fn apply_rules(display: *Display, client: *Client) void {
         const monitor_tagset = monitor.tagset[monitor.sel_tags];
         const is_tag_focused = (monitor_tagset & client.tags) == client.tags;
         if (!is_tag_focused) {
-            view(display, client.tags);
+            view(display, client.tags, wm);
         }
     }
 }
 
-fn update_client_list(display: *Display) void {
-    _ = xlib.XDeleteProperty(display.handle, display.root, atoms.net_client_list);
+fn update_client_list(display: *Display, wm: *WindowManager) void {
+    _ = xlib.XDeleteProperty(display.handle, display.root, wm.atoms.net_client_list);
 
     var current_monitor = monitor_mod.monitors;
     while (current_monitor) |monitor| {
         var current_client = monitor.clients;
         while (current_client) |client| {
-            _ = xlib.XChangeProperty(display.handle, display.root, atoms.net_client_list, xlib.XA_WINDOW, 32, xlib.PropModeAppend, @ptrCast(&client.window), 1);
+            _ = xlib.XChangeProperty(display.handle, display.root, wm.atoms.net_client_list, xlib.XA_WINDOW, 32, xlib.PropModeAppend, @ptrCast(&client.window), 1);
             current_client = client.next;
         }
         current_monitor = monitor.next;
     }
 }
 
-fn send_event(display: *Display, client: *Client, protocol: xlib.Atom) bool {
+fn send_event(display: *Display, client: *Client, protocol: xlib.Atom, wm: *WindowManager) bool {
     var protocols: [*c]xlib.Atom = undefined;
     var num_protocols: c_int = 0;
     var exists = false;
@@ -2265,7 +2232,7 @@ fn send_event(display: *Display, client: *Client, protocol: xlib.Atom) bool {
         var event: xlib.XEvent = undefined;
         event.type = xlib.ClientMessage;
         event.xclient.window = client.window;
-        event.xclient.message_type = atoms.wm_protocols;
+        event.xclient.message_type = wm.atoms.wm_protocols;
         event.xclient.format = 32;
         event.xclient.data.l[0] = @intCast(protocol);
         event.xclient.data.l[1] = xlib.CurrentTime;
