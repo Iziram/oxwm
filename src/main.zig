@@ -249,7 +249,6 @@ pub fn main() !void {
 
     cursors = Cursors.init(&display);
     _ = xlib.XDefineCursor(display.handle, display.root, cursors.normal);
-    client_mod.init(allocator);
     monitor_mod.init(allocator);
     tiling.set_display(display.handle);
     tiling.set_screen_size(display.screen_width(), display.screen_height());
@@ -697,7 +696,7 @@ fn handle_map_request(display: *Display, event: *xlib.XMapRequestEvent) void {
     if (window_attributes.override_redirect != 0) {
         return;
     }
-    if (client_mod.window_to_client(event.window) != null) {
+    if (client_mod.window_to_client(monitor_mod.monitors, event.window) != null) {
         return;
     }
 
@@ -705,7 +704,7 @@ fn handle_map_request(display: *Display, event: *xlib.XMapRequestEvent) void {
 }
 
 fn manage(display: *Display, win: xlib.Window, window_attrs: *xlib.XWindowAttributes) void {
-    const client = client_mod.create(win) orelse return;
+    const client = client_mod.create(gpa.allocator(), win) orelse return;
     var trans: xlib.Window = 0;
 
     client.x = window_attrs.x;
@@ -722,7 +721,7 @@ fn manage(display: *Display, win: xlib.Window, window_attrs: *xlib.XWindowAttrib
     update_title(display, client);
 
     if (xlib.XGetTransientForHint(display.handle, win, &trans) != 0) {
-        if (client_mod.window_to_client(trans)) |transient_client| {
+        if (client_mod.window_to_client(monitor_mod.monitors, trans)) |transient_client| {
             client.monitor = transient_client.monitor;
             client.tags = transient_client.tags;
         }
@@ -790,7 +789,7 @@ fn manage(display: *Display, win: xlib.Window, window_attrs: *xlib.XWindowAttrib
 }
 
 fn handle_configure_request(display: *Display, event: *xlib.XConfigureRequestEvent) void {
-    const client = client_mod.window_to_client(event.window);
+    const client = client_mod.window_to_client(monitor_mod.monitors, event.window);
 
     if (client) |managed_client| {
         if ((event.value_mask & xlib.c.CWBorderWidth) != 0) {
@@ -1816,7 +1815,7 @@ fn handle_button_press(display: *Display, event: *xlib.XButtonEvent) void {
         return;
     }
 
-    const click_client = client_mod.window_to_client(event.window);
+    const click_client = client_mod.window_to_client(monitor_mod.monitors, event.window);
     if (click_client) |found_client| {
         focus(display, found_client);
         if (monitor_mod.selected_monitor) |selmon| {
@@ -1848,7 +1847,7 @@ fn handle_button_press(display: *Display, event: *xlib.XButtonEvent) void {
 }
 
 fn handle_client_message(display: *Display, event: *xlib.XClientMessageEvent) void {
-    const client = client_mod.window_to_client(event.window) orelse return;
+    const client = client_mod.window_to_client(monitor_mod.monitors, event.window) orelse return;
 
     if (event.message_type == atoms.net_wm_state) {
         const action = event.data.l[0];
@@ -1877,13 +1876,13 @@ fn handle_client_message(display: *Display, event: *xlib.XClientMessageEvent) vo
 }
 
 fn handle_destroy_notify(display: *Display, event: *xlib.XDestroyWindowEvent) void {
-    const client = client_mod.window_to_client(event.window) orelse return;
+    const client = client_mod.window_to_client(monitor_mod.monitors, event.window) orelse return;
     std.debug.print("destroy_notify: window=0x{x}\n", .{event.window});
     unmanage(display, client);
 }
 
 fn handle_unmap_notify(display: *Display, event: *xlib.XUnmapEvent) void {
-    const client = client_mod.window_to_client(event.window) orelse return;
+    const client = client_mod.window_to_client(monitor_mod.monitors, event.window) orelse return;
     std.debug.print("unmap_notify: window=0x{x}\n", .{event.window});
     unmanage(display, client);
 }
@@ -1932,7 +1931,7 @@ fn unmanage(display: *Display, client: *Client) void {
         }
     }
 
-    client_mod.destroy(client);
+    client_mod.destroy(gpa.allocator(), client);
     update_client_list(display);
     bar_mod.invalidate_bars();
 }
@@ -1942,7 +1941,7 @@ fn handle_enter_notify(display: *Display, event: *xlib.XCrossingEvent) void {
         return;
     }
 
-    const client = client_mod.window_to_client(event.window);
+    const client = client_mod.window_to_client(monitor_mod.monitors, event.window);
     const target_mon = if (client) |c| c.monitor else monitor_mod.window_to_monitor(display.handle, display.root, event.window);
     const selmon = monitor_mod.selected_monitor;
 
@@ -2001,12 +2000,12 @@ fn handle_property_notify(display: *Display, event: *xlib.XPropertyEvent) void {
         return;
     }
 
-    const client = client_mod.window_to_client(event.window) orelse return;
+    const client = client_mod.window_to_client(monitor_mod.monitors, event.window) orelse return;
 
     if (event.atom == xlib.XA_WM_TRANSIENT_FOR) {
         var trans: xlib.Window = 0;
         if (!client.is_floating and xlib.XGetTransientForHint(display.handle, client.window, &trans) != 0) {
-            client.is_floating = client_mod.window_to_client(trans) != null;
+            client.is_floating = client_mod.window_to_client(monitor_mod.monitors, trans) != null;
             if (client.is_floating) {
                 if (client.monitor) |monitor| {
                     arrange(monitor);
