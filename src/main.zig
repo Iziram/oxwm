@@ -9,6 +9,84 @@ const lua = @import("config/lua.zig");
 
 const WindowManager = window_manager.WindowManager;
 
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    const default_config_path = try getConfigPath(allocator);
+    defer allocator.free(default_config_path);
+
+    var config_path: []const u8 = default_config_path;
+    var validate_mode: bool = false;
+    var args = std.process.args();
+    _ = args.skip();
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
+            if (args.next()) |path| config_path = path;
+        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            printHelp();
+            return;
+        } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
+            std.debug.print("{s}\n", .{build_options.version});
+            return;
+        } else if (std.mem.eql(u8, arg, "--init")) {
+            initConfig(allocator);
+            return;
+        } else if (std.mem.eql(u8, arg, "--validate")) {
+            validate_mode = true;
+        }
+    }
+
+    if (validate_mode) {
+        try validateConfig(allocator, config_path);
+        return;
+    }
+
+    std.debug.print("oxwm starting\n", .{});
+
+    var config = config_mod.Config.init(allocator);
+
+    if (lua.init(&config)) {
+        const loaded = if (std.fs.cwd().statFile(config_path)) |_| blk: {
+            break :blk lua.loadFile(config_path);
+        } else |_| blk: {
+            initConfig(allocator);
+            break :blk lua.loadConfig();
+        };
+
+        if (loaded) {
+            std.debug.print("loaded config from {s}\n", .{config_path});
+        } else {
+            std.debug.print("no config found, using defaults\n", .{});
+            config_mod.initializeDefaultConfig(&config);
+        }
+    } else {
+        std.debug.print("failed to init lua, using defaults\n", .{});
+        config_mod.initializeDefaultConfig(&config);
+    }
+
+    var wm = WindowManager.init(allocator, config, config_path) catch |err| {
+        std.debug.print("failed to start window manager: {}\n", .{err});
+        return;
+    };
+    defer wm.deinit();
+
+    std.debug.print("display opened: screen={d} root=0x{x}\n", .{ wm.display.screen, wm.display.root });
+    std.debug.print("successfully became window manager\n", .{});
+    std.debug.print("atoms initialized with EWMH support\n", .{});
+
+    wm.grabKeybinds();
+    wm.scanExistingWindows(window_manager.core.manage);
+
+    try runAutostartCommands(&wm);
+    std.debug.print("entering event loop\n", .{});
+    wm.run(handlers.handleEvent, window_manager.core.tickAnimations);
+
+    lua.deinit();
+    std.debug.print("oxwm exiting\n", .{});
+}
+
 fn printHelp() void {
     std.debug.print(
         \\oxwm - A window manager
@@ -33,18 +111,6 @@ fn printHelp() void {
         \\    Or just start oxwm and it will create one automatically
         \\
     , .{});
-}
-
-fn getConfigPath(allocator: std.mem.Allocator) ![]u8 {
-    const config_home = std.posix.getenv("XDG_CONFIG_HOME") orelse blk: {
-        const home = std.posix.getenv("HOME") orelse return error.CouldNotGetHomeDir;
-        break :blk try std.fs.path.join(allocator, &.{ home, ".config" });
-    };
-    // TODO: wtf is this shit
-    defer if (std.posix.getenv("XDG_CONFIG_HOME") == null) allocator.free(config_home);
-
-    const config_path = try std.fs.path.join(allocator, &.{ config_home, "oxwm", "config.lua" });
-    return config_path;
 }
 
 fn initConfig(allocator: std.mem.Allocator) void {
@@ -83,6 +149,18 @@ fn initConfig(allocator: std.mem.Allocator) void {
     std.debug.print("No compilation needed - changes take effect immediately!\n", .{});
 }
 
+fn getConfigPath(allocator: std.mem.Allocator) ![]u8 {
+    const config_home = std.posix.getenv("XDG_CONFIG_HOME") orelse blk: {
+        const home = std.posix.getenv("HOME") orelse return error.CouldNotGetHomeDir;
+        break :blk try std.fs.path.join(allocator, &.{ home, ".config" });
+    };
+    // TODO: wtf is this shit
+    defer if (std.posix.getenv("XDG_CONFIG_HOME") == null) allocator.free(config_home);
+
+    const config_path = try std.fs.path.join(allocator, &.{ config_home, "oxwm", "config.lua" });
+    return config_path;
+}
+
 fn validateConfig(allocator: std.mem.Allocator, config_path: []const u8) !void {
     var config = config_mod.Config.init(allocator);
     defer config.deinit();
@@ -106,86 +184,6 @@ fn validateConfig(allocator: std.mem.Allocator, config_path: []const u8) !void {
         std.debug.print("✗ config validation failed\n", .{});
         std.process.exit(1);
     }
-}
-
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-    defer _ = gpa.deinit();
-
-    const default_config_path = try getConfigPath(allocator);
-    defer allocator.free(default_config_path);
-
-    var config_path: []const u8 = default_config_path;
-    var validate_mode: bool = false;
-    var args = std.process.args();
-    _ = args.skip();
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
-            if (args.next()) |path| config_path = path;
-        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            printHelp();
-            return;
-        } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
-            std.debug.print("{s}\n", .{build_options.version});
-            return;
-        } else if (std.mem.eql(u8, arg, "--init")) {
-            initConfig(allocator);
-            return;
-        } else if (std.mem.eql(u8, arg, "--validate")) {
-            validate_mode = true;
-        }
-    }
-
-    if (validate_mode) {
-        try validateConfig(allocator, config_path);
-        return;
-    }
-
-    std.debug.print("oxwm starting\n", .{});
-
-    var config = config_mod.Config.init(allocator);
-    var config_path_global: ?[]const u8 = null;
-
-    if (lua.init(&config)) {
-        const loaded = if (std.fs.cwd().statFile(config_path)) |_|
-            lua.loadFile(config_path)
-        else |_| blk: {
-            initConfig(allocator);
-            break :blk lua.loadConfig();
-        };
-
-        if (loaded) {
-            config_path_global = config_path;
-            std.debug.print("loaded config from {s}\n", .{config_path});
-        } else {
-            std.debug.print("no config found, using defaults\n", .{});
-            config_mod.initializeDefaultConfig(&config);
-        }
-    } else {
-        std.debug.print("failed to init lua, using defaults\n", .{});
-        config_mod.initializeDefaultConfig(&config);
-    }
-
-    var wm = WindowManager.init(allocator, config, config_path_global) catch |err| {
-        std.debug.print("failed to start window manager: {}\n", .{err});
-        return;
-    };
-    defer wm.deinit();
-
-    std.debug.print("display opened: screen={d} root=0x{x}\n", .{ wm.display.screen, wm.display.root });
-    std.debug.print("successfully became window manager\n", .{});
-    std.debug.print("atoms initialized with EWMH support\n", .{});
-
-    wm.grabKeybinds();
-    wm.scanExistingWindows(window_manager.core.manage);
-
-    try runAutostartCommands(&wm);
-    std.debug.print("entering event loop\n", .{});
-    wm.run(handlers.handleEvent, window_manager.core.tickAnimations);
-
-    lua.deinit();
-    std.debug.print("oxwm exiting\n", .{});
 }
 
 fn runAutostartCommands(wm: *WindowManager) !void {
