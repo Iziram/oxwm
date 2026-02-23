@@ -5,10 +5,6 @@ const Keybind = config_mod.Keybind;
 const Action = config_mod.Action;
 const Rule = config_mod.Rule;
 const Block = config_mod.Block;
-const BlockType = config_mod.BlockType;
-const Mouse_Button = config_mod.MouseButton;
-const Click_Target = config_mod.ClickTarget;
-const Mouse_Action = config_mod.MouseAction;
 const ColorScheme = config_mod.ColorScheme;
 
 const c = @cImport({
