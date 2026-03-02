@@ -25,7 +25,6 @@ pub fn build(b: *std.Build) void {
     exe.use_lld = false;
 
     const lua = buildLua(b, target, optimize);
-
     exe.linkLibrary(lua);
     exe.linkSystemLibrary("X11");
     exe.linkSystemLibrary("Xinerama");
@@ -62,7 +61,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     src_main_unit_tests.use_lld = false;
-    src_main_unit_tests.linkSystemLibrary("lua5.4");
+    src_main_unit_tests.linkLibrary(lua);
     src_main_unit_tests.linkSystemLibrary("X11");
     src_main_unit_tests.linkSystemLibrary("Xinerama");
     src_main_unit_tests.linkSystemLibrary("Xft");
@@ -83,7 +82,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }));
-    lua_config_tests.linkSystemLibrary("lua5.4");
+    lua_config_tests.linkLibrary(lua);
     lua_config_tests.linkLibC();
     test_step.dependOn(&b.addRunArtifact(lua_config_tests).step);
 
