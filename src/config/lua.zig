@@ -1252,7 +1252,11 @@ fn parseClickAction(state: *c.lua_State, idx: c_int) ?config_mod.ClickAction {
         const floating = c.lua_toboolean(state, -1) != 0;
         c.lua_settop(state, -2);
 
-        return .{ .command = cmd.?, .floating = floating };
+        _ = c.lua_getfield(state, idx, "bypass_rules");
+        const bypass_rules = c.lua_toboolean(state, -1) != 0;
+        c.lua_settop(state, -2);
+
+        return .{ .command = cmd.?, .floating = floating, .bypass_rules = bypass_rules };
     }
     return null;
 }

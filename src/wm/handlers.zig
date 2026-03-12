@@ -211,6 +211,7 @@ fn handleButtonPress(event: *xlib.XButtonEvent, wm: *WindowManager) void {
             core.view(tag_mask, wm);
         } else if (bar.handleBlockClick(event.x)) |click_action| {
             wm.next_spawn_floating = click_action.floating;
+            wm.next_spawn_bypass_rules = click_action.bypass_rules;
             actions.spawnCommand(wm, click_action.command);
         }
         return;

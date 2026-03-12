@@ -40,7 +40,14 @@ pub fn manage(win: xlib.Window, window_attrs: *xlib.XWindowAttributes, wm: *Wind
 
     if (client.monitor == null) {
         client.monitor = wm.selected_monitor;
-        applyRules(client, wm);
+        if (wm.next_spawn_bypass_rules) {
+            if (client.monitor) |monitor| {
+                client.tags = monitor.tagset[monitor.sel_tags];
+            }
+            wm.next_spawn_bypass_rules = false;
+        } else {
+            applyRules(client, wm);
+        }
     }
 
     if (wm.next_spawn_floating) {

@@ -85,6 +85,7 @@ pub const WindowManager = struct {
 
     running: bool,
     next_spawn_floating: bool = false,
+    next_spawn_bypass_rules: bool = false,
     last_motion_monitor: ?*Monitor,
 
     /// Initialises the window manager

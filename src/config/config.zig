@@ -148,6 +148,7 @@ pub const FloatingPosition = enum {
 pub const ClickAction = struct {
     command: []const u8,
     floating: bool = false,
+    bypass_rules: bool = false,
 };
 
 pub const Block = struct {
