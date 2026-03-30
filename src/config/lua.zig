@@ -321,6 +321,9 @@ fn registerMiscFunctions(state: *c.lua_State) void {
     c.lua_pushcfunction(state, luaAutoTile);
     c.lua_setfield(state, -2, "auto_tile");
 
+    c.lua_pushcfunction(state, luaTiledResizeMode);
+    c.lua_setfield(state, -2, "tiled_resize_mode");
+
     c.lua_pushcfunction(state, luaQuit);
     c.lua_setfield(state, -2, "quit");
 
@@ -1113,6 +1116,13 @@ fn luaAutoTile(state: ?*c.lua_State) callconv(.c) c_int {
     return 0;
 }
 
+fn luaTiledResizeMode(state: ?*c.lua_State) callconv(.c) c_int {
+    const cfg = config orelse return 0;
+    const s = state orelse return 0;
+    cfg.tiled_resize_mode = c.lua_toboolean(s, 1) != 0;
+    return 0;
+}
+
 fn luaSetLayoutSymbol(state: ?*c.lua_State) callconv(.c) c_int {
     const cfg = config orelse return 0;
     const s = state orelse return 0;
@@ -1392,9 +1402,19 @@ fn keynameToKeysym(name: []const u8) ?u64 {
         .{ "bracketleft", 0x005b },
         .{ "bracketright", 0x005d },
         .{ "backslash", 0x005c },
+        .{ "colon", 0x003a },
         .{ "semicolon", 0x003b },
         .{ "apostrophe", 0x0027 },
+        .{ "quotedbl", 0x0022 },
+        .{ "ampersand", 0x0026 },
+        .{ "parenleft", 0x0028 },
+        .{ "parenright", 0x0029 },
+        .{ "underscore", 0x005f },
         .{ "grave", 0x0060 },
+        .{ "agrave", 0x00e0 },
+        .{ "egrave", 0x00e8 },
+        .{ "ccedilla", 0x00e7 },
+        .{ "eacute", 0x00e9 },
         .{ "Left", 0xff51 },
         .{ "Up", 0xff52 },
         .{ "Right", 0xff53 },

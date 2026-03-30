@@ -22,6 +22,7 @@ pub fn handleEvent(event: *xlib.XEvent, wm: *WindowManager) void {
     switch (event_type) {
         .map_request => handleMapRequest(&event.xmaprequest, wm),
         .configure_request => handleConfigureRequest(&event.xconfigurerequest, wm),
+        .configure_notify => handleConfigureNotify(&event.xconfigure, wm),
         .key_press => handleKeyPress(&event.xkey, wm),
         .destroy_notify => handleDestroyNotify(&event.xdestroywindow, wm),
         .unmap_notify => handleUnmapNotify(&event.xunmap, wm),
@@ -32,6 +33,7 @@ pub fn handleEvent(event: *xlib.XEvent, wm: *WindowManager) void {
         .button_press => handleButtonPress(&event.xbutton, wm),
         .expose => handleExpose(&event.xexpose, wm),
         .property_notify => handlePropertyNotify(&event.xproperty, wm),
+        .mapping_notify => handleMappingNotify(&event.xmapping, wm),
         else => {},
     }
 }
@@ -187,6 +189,27 @@ fn handleExpose(event: *xlib.XExposeEvent, wm: *WindowManager) void {
     if (bar_mod.windowToBar(wm.bars, event.window)) |bar| {
         bar.invalidate();
         bar.draw(wm.display.handle, wm.config);
+    }
+}
+
+fn handleConfigureNotify(event: *xlib.XConfigureEvent, wm: *WindowManager) void {
+    if (event.window != wm.display.root) return;
+
+    const dirty = wm.updateGeom();
+    if (dirty) {
+        wm.rebuildBars();
+        var mon = wm.monitors;
+        while (mon) |m| {
+            var c = m.clients;
+            while (c) |client| {
+                if (client.is_fullscreen) {
+                    tiling.resizeClient(client, m.mon_x, m.mon_y, m.mon_w, m.mon_h);
+                }
+                c = client.next;
+            }
+            core.arrange(m, wm);
+            mon = m.next;
+        }
     }
 }
 
@@ -362,5 +385,14 @@ fn handlePropertyNotify(event: *xlib.XPropertyEvent, wm: *WindowManager) void {
         core.updateTitle(client, wm);
     } else if (event.atom == wm.atoms.net_wm_window_type) {
         core.updateWindowType(client, wm);
+    }
+}
+
+fn handleMappingNotify(event: *xlib.XMappingEvent, wm: *WindowManager) void {
+    _ = xlib.XRefreshKeyboardMapping(event);
+    
+    if (event.request == xlib.MappingKeyboard or event.request == xlib.MappingModifier) {
+        wm.ungrabKeybinds();
+        wm.grabKeybinds();
     }
 }
